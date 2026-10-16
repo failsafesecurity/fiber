@@ -73,7 +73,7 @@ func (app *App) prefork(addr string, tlsConfig *tls.Config, cfg *ListenConfig) e
 	// the start, and canceling the context there only runs the master's shutdown hooks. A child
 	// starts to watch in preforkServe, once it has its listener.
 	if !IsChild() {
-		graceful := app.startGracefulShutdown(cfg)
+		graceful := app.watchGracefulContext(cfg)
 		defer graceful.wait()
 	}
 
@@ -118,7 +118,7 @@ func (app *App) preforkServe(tlsConfig *tls.Config, cfg *ListenConfig) func(ln n
 	return func(ln net.Listener) error {
 		// Watch the context only once the child has its listener, so that a bind that failed
 		// never ran the shutdown hooks, and wait out the shutdown before returning.
-		graceful := app.startGracefulShutdown(cfg)
+		graceful := app.watchGracefulContext(cfg)
 		defer graceful.wait()
 
 		// wrap a tls config around the listener if provided
@@ -135,7 +135,7 @@ func (app *App) preforkServe(tlsConfig *tls.Config, cfg *ListenConfig) func(ln n
 		}
 
 		// listen for incoming connections
-		return graceful.serve(ln)
+		return app.server.Serve(graceful.wrap(ln))
 	}
 }
 

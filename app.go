@@ -1386,14 +1386,9 @@ func (app *App) Shutdown() error {
 //
 // ShutdownWithTimeout does not close keepalive connections so its recommended to set ReadTimeout to something else than 0.
 func (app *App) ShutdownWithTimeout(timeout time.Duration) error {
-	return app.runShutdownWithTimeout(timeout, nil)
-}
-
-// runShutdownWithTimeout is ShutdownWithTimeout plus the draining flag that runShutdown takes.
-func (app *App) runShutdownWithTimeout(timeout time.Duration, draining *atomic.Bool) error {
 	ctx, cancelFunc := context.WithTimeout(context.Background(), timeout)
 	defer cancelFunc()
-	return app.runShutdown(ctx, draining)
+	return app.ShutdownWithContext(ctx)
 }
 
 // ShutdownWithContext shuts down the server and stops waiting once ctx is done; connections still active are not closed.

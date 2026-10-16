@@ -1930,15 +1930,15 @@ var (
 	gracefulPoints = []gracefulPoint{onListenPoint, beforeServePoint}
 )
 
-// gracefulModes are the two ways the context gets done before the server serves: prepare runs before
-// the call, and the context is canceled at the point otherwise. At the point the test always does the
-// same: it cancels the context (a no-op once prepare did) and keeps the startup there until the
-// shutdown has finished, which is what puts the shutdown before Serve without relying on timing.
-var gracefulModes = []struct {
+// gracefulStarts are the two states a GracefulContext can be in when a test calls Listen: not done, or
+// done already (prepare cancels it). A test that reaches a point of the startup cancels the context
+// there as well, which does nothing once it is done, and keeps the startup at the point until the
+// shutdown has finished: that is what puts the shutdown before Serve without relying on timing.
+var gracefulStarts = []struct {
 	prepare func(f *gracefulFixture)
 	name    string
 }{
-	{name: "canceled at the point"},
+	{name: "not done before the call"},
 	{name: "done before the call", prepare: func(f *gracefulFixture) { f.cancel() }},
 }
 
@@ -1950,14 +1950,14 @@ func Test_GracefulContext_DoneBeforeServe(t *testing.T) {
 
 	for _, entry := range gracefulEntries {
 		for _, point := range gracefulPoints {
-			for _, mode := range gracefulModes {
-				t.Run(entry.name+"/"+point.name+"/"+mode.name, func(t *testing.T) {
+			for _, start := range gracefulStarts {
+				t.Run(entry.name+"/"+point.name+"/"+start.name, func(t *testing.T) {
 					t.Parallel()
 
 					f := newGracefulFixture(t)
 					point.wire(f, func() { f.cancelAndAwait(t) })
-					if mode.prepare != nil {
-						mode.prepare(f)
+					if start.prepare != nil {
+						start.prepare(f)
 					}
 
 					f.requireStopped(t, f.start(entry.run))
@@ -1973,21 +1973,13 @@ func Test_GracefulContext_DoneBeforeServe(t *testing.T) {
 func Test_Listen_GracefulContext_BindFailureRunsNoHooks(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		prepare func(f *gracefulFixture)
-		name    string
-	}{
-		{name: "context not done"},
-		{name: "context already done", prepare: func(f *gracefulFixture) { f.cancel() }},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, start := range gracefulStarts {
+		t.Run(start.name, func(t *testing.T) {
 			t.Parallel()
 
 			f := newGracefulFixture(t)
-			if tc.prepare != nil {
-				tc.prepare(f)
+			if start.prepare != nil {
+				start.prepare(f)
 			}
 
 			require.Error(t, f.app.Listen(":99999", f.cfg))
@@ -2017,29 +2009,6 @@ func Test_Listen_GracefulContext_ClosesListener(t *testing.T) {
 	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
-// The function a prefork child serves the listener it bound with has to stop on a GracefulContext
-// done before it serves, as Listen does: canceled right before it serves, or done before the child
-// ran it. It starts to watch the context itself, so this covers the real arming.
-func Test_preforkServe_GracefulContext_DoneBeforeServe(t *testing.T) {
-	t.Parallel()
-
-	for _, mode := range gracefulModes {
-		t.Run(mode.name, func(t *testing.T) {
-			t.Parallel()
-
-			f := newGracefulFixture(t)
-			// The child calls this right before it serves.
-			f.cfg.ListenerAddrFunc = func(net.Addr) { f.cancelAndAwait(t) }
-			if mode.prepare != nil {
-				mode.prepare(f)
-			}
-
-			f.requireStopped(t, f.start(func(f *gracefulFixture) error { return f.app.preforkServe(nil, &f.cfg)(f.ln) }))
-			listenerEntry.requireClosed(t, f)
-		})
-	}
-}
-
 // closeSignalListener reports the first Close of the listener it wraps.
 type closeSignalListener struct {
 	net.Listener
@@ -2063,8 +2032,8 @@ func Test_gracefulRun_Draining_ClosesListenerOnce(t *testing.T) {
 	ln := &closeSignalListener{Listener: f.ln, closed: make(chan struct{})}
 
 	f.app.startupProcess()
-	graceful := f.app.startGracefulShutdown(&f.cfg)
-	served := f.start(func(*gracefulFixture) error { return graceful.serve(ln) })
+	graceful := f.app.watchGracefulContext(&f.cfg)
+	served := f.start(func(*gracefulFixture) error { return f.app.server.Serve(graceful.wrap(ln)) })
 	waitUntilServing(t, f.ln)
 
 	// Drain as shutdown does once the OnPreShutdown hooks are done, but close nothing yet. The
@@ -2282,28 +2251,29 @@ func Test_gracefulListener(t *testing.T) {
 func Test_gracefulRun(t *testing.T) {
 	t.Parallel()
 
-	t.Run("without a GracefulContext it hands the listener to fasthttp as it is", func(t *testing.T) {
+	t.Run("without a GracefulContext wrap hands the listener back as it is", func(t *testing.T) {
 		t.Parallel()
 
-		graceful := New().startGracefulShutdown(&ListenConfig{})
-		plain := &stubListener{acceptErr: net.ErrClosed}
+		graceful := New().watchGracefulContext(&ListenConfig{})
+		plain := &stubListener{}
 
-		require.NoError(t, graceful.serve(plain))
-		require.Equal(t, int32(1), plain.accepts.Load())
-		require.Zero(t, plain.closes.Load())
+		require.Same(t, plain, graceful.wrap(plain))
 		graceful.wait()
 	})
 
-	t.Run("with a GracefulContext it wraps the listener", func(t *testing.T) {
+	t.Run("with a GracefulContext wrap wraps the listener, which follows the flag of the run", func(t *testing.T) {
 		t.Parallel()
 
-		graceful := New().startGracefulShutdown(&ListenConfig{GracefulContext: t.Context()})
-		graceful.draining.Store(true)
-		wrapped := &stubListener{}
+		graceful := New().watchGracefulContext(&ListenConfig{GracefulContext: t.Context()})
+		inner := &stubListener{}
 
-		require.NoError(t, graceful.serve(wrapped))
-		require.Zero(t, wrapped.accepts.Load())
-		require.Equal(t, int32(1), wrapped.closes.Load())
+		wrapped := graceful.wrap(inner)
+		require.IsType(t, &gracefulListener{}, wrapped)
+
+		graceful.draining.Store(true)
+		_, err := wrapped.Accept()
+		require.ErrorIs(t, err, net.ErrClosed)
+		require.Zero(t, inner.accepts.Load(), "a draining run must not reach the wrapped Accept")
 		graceful.wait()
 	})
 
@@ -2311,8 +2281,8 @@ func Test_gracefulRun(t *testing.T) {
 		t.Parallel()
 
 		app := New()
-		first := app.startGracefulShutdown(&ListenConfig{GracefulContext: t.Context()})
-		second := app.startGracefulShutdown(&ListenConfig{GracefulContext: t.Context()})
+		first := app.watchGracefulContext(&ListenConfig{GracefulContext: t.Context()})
+		second := app.watchGracefulContext(&ListenConfig{GracefulContext: t.Context()})
 
 		first.draining.Store(true)
 		require.False(t, second.draining.Load())

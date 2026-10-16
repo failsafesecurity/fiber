@@ -7,6 +7,7 @@ package fiber
 import (
 	"crypto/tls"
 	"io"
+	"net"
 	"os"
 	"testing"
 	"time"
@@ -122,6 +123,30 @@ func Test_Prefork_Logger(t *testing.T) {
 	l := preforkLogger{}
 	// Should not panic
 	l.Printf("test %s", "message")
+}
+
+// The function a prefork child serves the listener it bound with has to stop on a GracefulContext
+// done before it serves, as Listen does: canceled right before it serves, or done before the child
+// ran it. It starts to watch the context itself, so this covers the real arming. The fixture and
+// the table come from listen_test.go.
+func Test_preforkServe_GracefulContext_DoneBeforeServe(t *testing.T) {
+	t.Parallel()
+
+	for _, start := range gracefulStarts {
+		t.Run(start.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newGracefulFixture(t)
+			// The child calls this right before it serves.
+			f.cfg.ListenerAddrFunc = func(net.Addr) { f.cancelAndAwait(t) }
+			if start.prepare != nil {
+				start.prepare(f)
+			}
+
+			f.requireStopped(t, f.start(func(f *gracefulFixture) error { return f.app.preforkServe(nil, &f.cfg)(f.ln) }))
+			listenerEntry.requireClosed(t, f)
+		})
+	}
 }
 
 func setupIsChild(t *testing.T) {
