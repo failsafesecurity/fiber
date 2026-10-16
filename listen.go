@@ -52,9 +52,7 @@ type ListenConfig struct {
 	//
 	// A context that is done before the server starts to serve, including one that is
 	// already done when Listen or Listener is called, shuts it down the same way:
-	// Listen and Listener return once the shutdown has finished. When it has already
-	// stopped the server by the time the startup reaches the OnListen hooks, they skip
-	// the rest of the startup: the OnListen hooks, the startup message and BeforeServeFunc.
+	// Listen and Listener return once the shutdown has finished.
 	//
 	// With EnablePrefork the context stops only the process it is canceled in;
 	// deliver the signal to every process so each child drains its own connections.
@@ -90,7 +88,6 @@ type ListenConfig struct {
 	ListenerAddrFunc func(addr net.Addr) `json:"listener_addr_func"`
 
 	// BeforeServeFunc allows customizing and accessing fiber app before serving the app.
-	// It is not called when a shutdown started by GracefulContext has already stopped the server.
 	//
 	// Default: nil
 	BeforeServeFunc func(app *App) error `json:"before_serve_func"`
@@ -291,10 +288,6 @@ func (app *App) Listen(addr string, config ...ListenConfig) error {
 		}
 	}
 
-	// Graceful shutdown
-	waitForShutdown := app.startGracefulShutdown(&cfg)
-	defer waitForShutdown()
-
 	// Start prefork
 	if cfg.EnablePrefork {
 		return app.prefork(addr, tlsConfig, &cfg)
@@ -305,6 +298,11 @@ func (app *App) Listen(addr string, config ...ListenConfig) error {
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
+
+	// Graceful shutdown, armed once the listener exists so that a bind that fails never
+	// runs the shutdown hooks, even for a context that is already done.
+	graceful := app.startGracefulShutdown(&cfg)
+	defer graceful.wait()
 
 	// Close the listener on any path that doesn't reach Serve (which otherwise
 	// takes ownership of it) — an early error return or a panicking hook — so
@@ -321,11 +319,6 @@ func (app *App) Listen(addr string, config ...ListenConfig) error {
 
 	listenData := app.prepareListenData(ln.Addr().String(), getTLSConfig(ln) != nil, &cfg, nil)
 
-	// Nothing left to announce once the shutdown has stopped the server; the deferred close releases ln.
-	if app.stoppedBeforeServe(&cfg) {
-		return nil
-	}
-
 	// run hooks
 	app.runOnListenHooks(listenData)
 
@@ -341,7 +334,7 @@ func (app *App) Listen(addr string, config ...ListenConfig) error {
 	app.hookHeaderReceived()
 
 	served = true
-	return app.serveGraceful(ln, &cfg)
+	return graceful.serve(ln)
 }
 
 // warnSupersededTLSFields logs the ListenConfig TLS fields a supplied TLSConfig
@@ -450,20 +443,13 @@ func (app *App) Listener(ln net.Listener, config ...ListenConfig) error {
 	warnIgnoredTLSFieldsOnListener(&cfg, ln)
 
 	// Graceful shutdown
-	waitForShutdown := app.startGracefulShutdown(&cfg)
-	defer waitForShutdown()
+	graceful := app.startGracefulShutdown(&cfg)
+	defer graceful.wait()
 
 	// prepare the server for the start
 	app.startupProcess()
 
 	listenData := app.prepareListenData(ln.Addr().String(), getTLSConfig(ln) != nil, &cfg, nil)
-
-	// Nothing left to announce once the shutdown has stopped the server. It closes the listeners
-	// a running server holds, so this one is closed too.
-	if app.stoppedBeforeServe(&cfg) {
-		_ = ln.Close() //nolint:errcheck // best-effort, as the shutdown's own close of a listener
-		return nil
-	}
 
 	// run hooks
 	app.runOnListenHooks(listenData)
@@ -484,7 +470,7 @@ func (app *App) Listener(ln net.Listener, config ...ListenConfig) error {
 	}
 	app.hookHeaderReceived()
 
-	return app.serveGraceful(ln, &cfg)
+	return graceful.serve(ln)
 }
 
 // Create listener function.
@@ -742,63 +728,71 @@ func (app *App) printRoutesMessage() {
 	_ = w.Flush() //nolint:errcheck // It is fine to ignore the error here
 }
 
-// startGracefulShutdown watches cfg.GracefulContext and returns the cleanup Listen
-// defers. Serve returns once the listener closes, so the cleanup waits out the drain.
-func (app *App) startGracefulShutdown(cfg *ListenConfig) func() {
+// gracefulRun is the graceful shutdown of one Listen, Listener or prefork run: it ties
+// ListenConfig.GracefulContext to the listener the run serves.
+//
+// fasthttp's Shutdown closes only the listeners Serve has already registered, so one that
+// runs during startup closes nothing and the Serve that follows would never return. serve
+// therefore wraps the listener so that it stops Serve itself.
+type gracefulRun struct {
+	app *App
+	// stop ends the watch of the context; nil when no GracefulContext is set.
+	stop func() bool
+	// done is closed when the shutdown the watch started has finished.
+	done chan struct{}
+	// draining is set once that shutdown begins to stop the server from accepting: after the
+	// OnPreShutdown hooks, right before fasthttp is told to close its listeners.
+	draining atomic.Bool
+}
+
+// startGracefulShutdown watches cfg.GracefulContext. The caller serves through the returned
+// run and defers its wait.
+func (app *App) startGracefulShutdown(cfg *ListenConfig) *gracefulRun {
+	g := &gracefulRun{app: app}
 	if cfg.GracefulContext == nil {
-		return func() {}
+		return g
 	}
 
-	app.gracefulDraining.Store(false)
-
-	done := make(chan struct{})
-	stop := context.AfterFunc(cfg.GracefulContext, func() {
-		defer close(done)
-		app.gracefulShutdown(cfg)
+	g.done = make(chan struct{})
+	g.stop = context.AfterFunc(cfg.GracefulContext, func() {
+		defer close(g.done)
+		app.gracefulShutdown(cfg, &g.draining)
 	})
 
-	return func() {
-		if !stop() {
-			<-done
-		}
+	return g
+}
+
+// wait ends the watch. Serve returns once the listener closes, so a shutdown that has begun
+// is waited out: the caller must not hand control back while it is still draining.
+func (g *gracefulRun) wait() {
+	if g.stop != nil && !g.stop() {
+		<-g.done
 	}
 }
 
-func (app *App) gracefulShutdown(cfg *ListenConfig) {
-	ctx := context.Background()
+// serve hands ln to fasthttp. With a GracefulContext, ln is wrapped so that a shutdown which
+// ran before Serve registered it, and so closed nothing, still ends Serve.
+func (g *gracefulRun) serve(ln net.Listener) error {
+	if g.stop != nil {
+		ln = &gracefulListener{Listener: ln, draining: &g.draining}
+	}
+
+	return g.app.server.Serve(ln)
+}
+
+func (app *App) gracefulShutdown(cfg *ListenConfig, draining *atomic.Bool) {
+	// The OnPostShutdown hooks are fired by the shutdown with the real error, so we must not
+	// fire them again here or they would run twice. That error is already delivered to those
+	// hooks, so it is intentionally ignored here.
 	if cfg != nil && cfg.ShutdownTimeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, cfg.ShutdownTimeout)
-		defer cancel()
+		_ = app.runShutdownWithTimeout(cfg.ShutdownTimeout, draining) //nolint:errcheck // error is delivered to OnPostShutdown hooks
+	} else {
+		_ = app.runShutdown(context.Background(), draining) //nolint:errcheck // error is delivered to OnPostShutdown hooks
 	}
-
-	// The OnPostShutdown hooks are fired by runShutdown with the real error, so we
-	// must not fire them again here or they would run twice. That error is
-	// already delivered to those hooks, so it is intentionally ignored here.
-	_ = app.runShutdown(ctx, &app.gracefulDraining) //nolint:errcheck // error is delivered to OnPostShutdown hooks
 }
 
-// stoppedBeforeServe reports whether the shutdown that cfg's GracefulContext started has
-// already stopped the server from accepting, which ends the run. gracefulDraining only
-// speaks for this run when cfg armed a GracefulContext, as it is cleared when one is armed.
-func (app *App) stoppedBeforeServe(cfg *ListenConfig) bool {
-	return cfg.GracefulContext != nil && app.gracefulDraining.Load()
-}
-
-// serveGraceful hands ln to fasthttp and honors cfg.GracefulContext. Shutdown only closes
-// the listeners Serve has already registered, so one that ran earlier closed nothing and
-// the Serve that follows would never return. With a GracefulContext, ln is wrapped so that
-// it stops Serve itself.
-func (app *App) serveGraceful(ln net.Listener, cfg *ListenConfig) error {
-	if cfg.GracefulContext != nil {
-		ln = &gracefulListener{Listener: ln, draining: &app.gracefulDraining}
-	}
-
-	return app.server.Serve(ln)
-}
-
-// gracefulListener ends Serve once the shutdown that GracefulContext started has stopped
-// the server from accepting, however early that is.
+// gracefulListener ends Serve once the shutdown that GracefulContext started is draining, that
+// is, has begun to stop the server from accepting, however early that is.
 //
 // Serve registers a listener before it first accepts on it, and the shutdown sets draining
 // before it closes the registered listeners. So either the shutdown finds the listener and

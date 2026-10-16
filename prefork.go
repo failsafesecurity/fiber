@@ -69,8 +69,13 @@ func (app *App) prefork(addr string, tlsConfig *tls.Config, cfg *ListenConfig) e
 		}
 	}
 
+	// Each process watches GracefulContext on its own. The master never serves, so canceling
+	// it there only runs the master's shutdown hooks.
+	graceful := app.startGracefulShutdown(cfg)
+	defer graceful.wait()
+
 	// Child process: serve function wraps TLS, starts up process, etc.
-	p.ServeFunc = app.preforkServe(tlsConfig, cfg)
+	p.ServeFunc = app.preforkServe(tlsConfig, cfg, graceful)
 
 	// Master callback: child spawned → execute OnFork hooks
 	p.OnChildSpawn = func(pid int) error {
@@ -106,7 +111,7 @@ func (app *App) prefork(addr string, tlsConfig *tls.Config, cfg *ListenConfig) e
 
 // preforkServe returns what a prefork child runs on the listener it inherits from the
 // master: it wraps TLS around it, starts up the process and serves.
-func (app *App) preforkServe(tlsConfig *tls.Config, cfg *ListenConfig) func(ln net.Listener) error {
+func (app *App) preforkServe(tlsConfig *tls.Config, cfg *ListenConfig, graceful *gracefulRun) func(ln net.Listener) error {
 	return func(ln net.Listener) error {
 		// wrap a tls config around the listener if provided
 		if tlsConfig != nil {
@@ -122,7 +127,7 @@ func (app *App) preforkServe(tlsConfig *tls.Config, cfg *ListenConfig) func(ln n
 		}
 
 		// listen for incoming connections
-		return app.serveGraceful(ln, cfg)
+		return graceful.serve(ln)
 	}
 }
 

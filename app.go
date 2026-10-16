@@ -131,10 +131,6 @@ type App struct {
 	// contains the information if the route stack has been changed to build the optimized tree
 	hasRoutesRefreshed bool
 	connStateHooked    bool
-	// gracefulDraining is set once a shutdown started by GracefulContext has stopped
-	// the server from accepting, and cleared when the next Listen or Listener arms
-	// its own. It is what tells a Serve that starts after that shutdown to stand down.
-	gracefulDraining atomic.Bool
 	// hasCustomCtx tracks whether app uses a custom context implementation
 	hasCustomCtx bool
 	// hasParamRoutes tracks whether any route consults the per-request slash
@@ -1390,9 +1386,14 @@ func (app *App) Shutdown() error {
 //
 // ShutdownWithTimeout does not close keepalive connections so its recommended to set ReadTimeout to something else than 0.
 func (app *App) ShutdownWithTimeout(timeout time.Duration) error {
+	return app.runShutdownWithTimeout(timeout, nil)
+}
+
+// runShutdownWithTimeout is ShutdownWithTimeout plus the draining flag that runShutdown takes.
+func (app *App) runShutdownWithTimeout(timeout time.Duration, draining *atomic.Bool) error {
 	ctx, cancelFunc := context.WithTimeout(context.Background(), timeout)
 	defer cancelFunc()
-	return app.ShutdownWithContext(ctx)
+	return app.runShutdown(ctx, draining)
 }
 
 // ShutdownWithContext shuts down the server and stops waiting once ctx is done; connections still active are not closed.
@@ -1404,9 +1405,11 @@ func (app *App) ShutdownWithContext(ctx context.Context) error {
 	return app.runShutdown(ctx, nil)
 }
 
-// runShutdown is ShutdownWithContext. A non-nil draining is set once the OnPreShutdown
-// hooks are done, before the server is told to stop accepting, so that a Serve
-// the server has not registered a listener for yet can still see the shutdown.
+// runShutdown is the body of ShutdownWithContext, which passes a nil draining. The graceful
+// shutdown of a GracefulContext passes the flag of its run, and runShutdown sets it once the
+// OnPreShutdown hooks are done, right before the server is told to stop accepting. A Serve
+// that has not registered its listener by then closes nothing in that shutdown, and finds
+// the flag instead.
 func (app *App) runShutdown(ctx context.Context, draining *atomic.Bool) error {
 	app.mutex.Lock()
 	server := app.server
