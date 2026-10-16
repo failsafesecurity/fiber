@@ -69,13 +69,16 @@ func (app *App) prefork(addr string, tlsConfig *tls.Config, cfg *ListenConfig) e
 		}
 	}
 
-	// Each process watches GracefulContext on its own. The master never serves, so canceling
-	// it there only runs the master's shutdown hooks.
-	graceful := app.startGracefulShutdown(cfg)
-	defer graceful.wait()
+	// Each process watches GracefulContext on its own. The master never serves: it watches from
+	// the start, and canceling the context there only runs the master's shutdown hooks. A child
+	// starts to watch in preforkServe, once it has its listener.
+	if !IsChild() {
+		graceful := app.startGracefulShutdown(cfg)
+		defer graceful.wait()
+	}
 
 	// Child process: serve function wraps TLS, starts up process, etc.
-	p.ServeFunc = app.preforkServe(tlsConfig, cfg, graceful)
+	p.ServeFunc = app.preforkServe(tlsConfig, cfg)
 
 	// Master callback: child spawned → execute OnFork hooks
 	p.OnChildSpawn = func(pid int) error {
@@ -109,10 +112,15 @@ func (app *App) prefork(addr string, tlsConfig *tls.Config, cfg *ListenConfig) e
 	return nil
 }
 
-// preforkServe returns what a prefork child runs on the listener it inherits from the
-// master: it wraps TLS around it, starts up the process and serves.
-func (app *App) preforkServe(tlsConfig *tls.Config, cfg *ListenConfig, graceful *gracefulRun) func(ln net.Listener) error {
+// preforkServe returns what a prefork child runs on the listener it has bound: it starts to
+// watch GracefulContext, wraps TLS around the listener, starts up the process and serves.
+func (app *App) preforkServe(tlsConfig *tls.Config, cfg *ListenConfig) func(ln net.Listener) error {
 	return func(ln net.Listener) error {
+		// Watch the context only once the child has its listener, so that a bind that failed
+		// never ran the shutdown hooks, and wait out the shutdown before returning.
+		graceful := app.startGracefulShutdown(cfg)
+		defer graceful.wait()
+
 		// wrap a tls config around the listener if provided
 		if tlsConfig != nil {
 			ln = tls.NewListener(ln, tlsConfig)

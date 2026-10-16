@@ -1715,6 +1715,18 @@ func Test_GracefulShutdown_NegativeTimeoutWaitsIndefinitely(t *testing.T) {
 	require.NoError(t, <-errs)
 }
 
+// receiveOrTimeout returns what ch delivers, or false after five seconds. A hang is what these tests
+// catch, so the bound only has to outlast a slow machine.
+func receiveOrTimeout[T any](ch <-chan T) (T, bool) {
+	select {
+	case v := <-ch:
+		return v, true
+	case <-time.After(5 * time.Second):
+		var zero T
+		return zero, false
+	}
+}
+
 // shutdownProbe counts the shutdown hooks of an app and keeps the error OnPostShutdown got.
 type shutdownProbe struct {
 	postErr error
@@ -1747,9 +1759,7 @@ func newShutdownProbe(app *App) *shutdownProbe {
 func (p *shutdownProbe) await(t *testing.T) {
 	t.Helper()
 
-	select {
-	case <-p.posted:
-	case <-time.After(5 * time.Second):
+	if _, ok := receiveOrTimeout(p.posted); !ok {
 		t.Error("OnPostShutdown did not run")
 	}
 }
@@ -1773,13 +1783,12 @@ func (p *shutdownProbe) requireCleanShutdown(t *testing.T) {
 func awaitServe(t *testing.T, errs <-chan error) error {
 	t.Helper()
 
-	select {
-	case err := <-errs:
-		return err
-	case <-time.After(5 * time.Second):
+	err, ok := receiveOrTimeout(errs)
+	if !ok {
 		t.Fatal("the server kept serving: it did not return")
-		return nil
 	}
+
+	return err
 }
 
 // getOnNewConn makes one request over a new connection of ln, so that it needs an Accept.
@@ -1842,14 +1851,8 @@ func (f *gracefulFixture) start(run func(f *gracefulFixture) error) <-chan error
 	return errs
 }
 
-// awaitShutdown returns once the shutdown has finished.
-func (f *gracefulFixture) awaitShutdown(t *testing.T) {
-	t.Helper()
-
-	f.probe.await(t)
-}
-
-// cancelAndAwait cancels the context and returns once the shutdown it starts has finished.
+// cancelAndAwait cancels the context, which does nothing to one that is done already, and returns
+// once the shutdown has finished.
 func (f *gracefulFixture) cancelAndAwait(t *testing.T) {
 	t.Helper()
 
@@ -1927,23 +1930,16 @@ var (
 	gracefulPoints = []gracefulPoint{onListenPoint, beforeServePoint}
 )
 
-// gracefulModes are the two ways the context gets done before the server serves. atPoint is what
-// the test does at a point of the startup: it keeps the startup there until the shutdown has
-// finished, which is what puts the shutdown before Serve without relying on timing.
+// gracefulModes are the two ways the context gets done before the server serves: prepare runs before
+// the call, and the context is canceled at the point otherwise. At the point the test always does the
+// same: it cancels the context (a no-op once prepare did) and keeps the startup there until the
+// shutdown has finished, which is what puts the shutdown before Serve without relying on timing.
 var gracefulModes = []struct {
 	prepare func(f *gracefulFixture)
-	atPoint func(f *gracefulFixture, t *testing.T)
 	name    string
 }{
-	{
-		name:    "canceled at the point",
-		atPoint: (*gracefulFixture).cancelAndAwait,
-	},
-	{
-		name:    "done before the call",
-		prepare: func(f *gracefulFixture) { f.cancel() },
-		atPoint: (*gracefulFixture).awaitShutdown,
-	},
+	{name: "canceled at the point"},
+	{name: "done before the call", prepare: func(f *gracefulFixture) { f.cancel() }},
 }
 
 // Issue #4763: a GracefulContext done before the server serves left Listen and Listener serving, as
@@ -1959,7 +1955,7 @@ func Test_GracefulContext_DoneBeforeServe(t *testing.T) {
 					t.Parallel()
 
 					f := newGracefulFixture(t)
-					point.wire(f, func() { mode.atPoint(f, t) })
+					point.wire(f, func() { f.cancelAndAwait(t) })
 					if mode.prepare != nil {
 						mode.prepare(f)
 					}
@@ -2021,21 +2017,27 @@ func Test_Listen_GracefulContext_ClosesListener(t *testing.T) {
 	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
-// The function a prefork child serves its inherited listener with has to stop on a GracefulContext
-// done before it serves, as Listen does. prefork arms the run before the child starts it.
+// The function a prefork child serves the listener it bound with has to stop on a GracefulContext
+// done before it serves, as Listen does: canceled right before it serves, or done before the child
+// ran it. It starts to watch the context itself, so this covers the real arming.
 func Test_preforkServe_GracefulContext_DoneBeforeServe(t *testing.T) {
 	t.Parallel()
 
-	f := newGracefulFixture(t)
-	// The child calls this right before it serves.
-	f.cfg.ListenerAddrFunc = func(net.Addr) { f.cancelAndAwait(t) }
+	for _, mode := range gracefulModes {
+		t.Run(mode.name, func(t *testing.T) {
+			t.Parallel()
 
-	graceful := f.app.startGracefulShutdown(&f.cfg)
-	errs := f.start(func(f *gracefulFixture) error { return f.app.preforkServe(nil, &f.cfg, graceful)(f.ln) })
+			f := newGracefulFixture(t)
+			// The child calls this right before it serves.
+			f.cfg.ListenerAddrFunc = func(net.Addr) { f.cancelAndAwait(t) }
+			if mode.prepare != nil {
+				mode.prepare(f)
+			}
 
-	f.requireStopped(t, errs)
-	graceful.wait()
-	listenerEntry.requireClosed(t, f)
+			f.requireStopped(t, f.start(func(f *gracefulFixture) error { return f.app.preforkServe(nil, &f.cfg)(f.ln) }))
+			listenerEntry.requireClosed(t, f)
+		})
+	}
 }
 
 // closeSignalListener reports the first Close of the listener it wraps.
@@ -2071,9 +2073,7 @@ func Test_gracefulRun_Draining_ClosesListenerOnce(t *testing.T) {
 	code, err := getOnNewConn(f.ln)
 	require.NoError(t, err)
 	require.Equal(t, StatusOK, code)
-	select {
-	case <-ln.closed:
-	case <-time.After(5 * time.Second):
+	if _, ok := receiveOrTimeout(ln.closed); !ok {
 		t.Fatal("Accept did not see the drain")
 	}
 	require.NoError(t, awaitServe(t, served))
@@ -2147,9 +2147,7 @@ func Test_GracefulContext_ServesDuringOnPreShutdown(t *testing.T) {
 				tc.trigger(t, f)
 			}
 
-			select {
-			case <-inHook:
-			case <-time.After(5 * time.Second):
+			if _, ok := receiveOrTimeout(inHook); !ok {
 				t.Fatal("OnPreShutdown did not run")
 			}
 			for i := range 3 {
@@ -2193,12 +2191,11 @@ func Test_Listen_GracefulContext_CanceledAtRandomTimes(t *testing.T) {
 			time.Sleep(time.Duration(i%50) * 20 * time.Microsecond)
 			cancel()
 
-			select {
-			case err := <-errs:
-				results <- err
-			case <-time.After(5 * time.Second):
-				results <- errHung
+			err, ok := receiveOrTimeout(errs)
+			if !ok {
+				err = errHung
 			}
+			results <- err
 		})
 	}
 	wg.Wait()
@@ -2209,7 +2206,9 @@ func Test_Listen_GracefulContext_CanceledAtRandomTimes(t *testing.T) {
 	}
 }
 
-// stubListener counts what a gracefulListener forwards to the listener it wraps.
+// stubListener counts what a gracefulListener forwards to the listener it wraps. It never hands out
+// a connection: without an acceptErr its Accept reports a closed listener, so a Serve that is given
+// it by mistake returns instead of calling Accept in a loop for ever.
 type stubListener struct {
 	acceptErr error
 	closeErr  error
@@ -2219,6 +2218,10 @@ type stubListener struct {
 
 func (s *stubListener) Accept() (net.Conn, error) {
 	s.accepts.Add(1)
+	if s.acceptErr == nil {
+		return nil, net.ErrClosed
+	}
+
 	return nil, s.acceptErr
 }
 
@@ -2331,7 +2334,7 @@ var benchSinkConn net.Conn
 
 // Benchmark_gracefulListener_Accept is what the wrapper adds per accepted connection when a
 // GracefulContext is set: Serve calls Accept once per connection, and nothing else of the wrapper
-// is on the hot path. The loopback accept is the cost of one real connection, for scale.
+// is on the hot path.
 func Benchmark_gracefulListener_Accept(b *testing.B) {
 	raw := net.Listener(benchListener{conn: benchConn{}})
 	graceful := net.Listener(&gracefulListener{Listener: raw, draining: new(atomic.Bool)})
@@ -2351,30 +2354,6 @@ func Benchmark_gracefulListener_Accept(b *testing.B) {
 			}
 		})
 	}
-
-	b.Run("tcp loopback accept and dial, for scale", func(b *testing.B) {
-		ln, err := net.Listen(NetworkTCP4, "127.0.0.1:0")
-		require.NoError(b, err)
-		defer func() { _ = ln.Close() }() //nolint:errcheck // the benchmark is over, a failed close changes nothing
-		go func() {
-			for {
-				conn, acceptErr := ln.Accept()
-				if acceptErr != nil {
-					return
-				}
-				_ = conn.Close() //nolint:errcheck // the connection only exists to be accepted
-			}
-		}()
-
-		b.ReportAllocs()
-		for b.Loop() {
-			conn, dialErr := net.Dial(NetworkTCP4, ln.Addr().String())
-			if dialErr != nil {
-				b.Fatal(dialErr)
-			}
-			_ = conn.Close() //nolint:errcheck // the connection only exists to be accepted
-		}
-	})
 }
 
 func Test_Listen_TLS_PartialCertConfig(t *testing.T) {

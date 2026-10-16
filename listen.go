@@ -728,8 +728,9 @@ func (app *App) printRoutesMessage() {
 	_ = w.Flush() //nolint:errcheck // It is fine to ignore the error here
 }
 
-// gracefulRun is the graceful shutdown of one Listen, Listener or prefork run: it ties
-// ListenConfig.GracefulContext to the listener the run serves.
+// gracefulRun is the graceful shutdown of one process serving through Listen, Listener or a
+// prefork child, or supervising as the prefork master: it ties ListenConfig.GracefulContext to
+// the listener the run serves.
 //
 // fasthttp's Shutdown closes only the listeners Serve has already registered, so one that
 // runs during startup closes nothing and the Serve that follows would never return. serve
