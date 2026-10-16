@@ -22,6 +22,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -130,6 +131,10 @@ type App struct {
 	// contains the information if the route stack has been changed to build the optimized tree
 	hasRoutesRefreshed bool
 	connStateHooked    bool
+	// gracefulStopped is set once a shutdown started by GracefulContext stops the
+	// server from accepting, and cleared when the next Listen or Listener arms its
+	// own. It is what tells a Serve that starts after that shutdown to stand down.
+	gracefulStopped atomic.Bool
 	// hasCustomCtx tracks whether app uses a custom context implementation
 	hasCustomCtx bool
 	// hasParamRoutes tracks whether any route consults the per-request slash
@@ -1396,6 +1401,13 @@ func (app *App) ShutdownWithTimeout(timeout time.Duration) error {
 //
 // ShutdownWithContext does not close keepalive connections so its recommended to set ReadTimeout to something else than 0.
 func (app *App) ShutdownWithContext(ctx context.Context) error {
+	return app.runShutdown(ctx, nil)
+}
+
+// runShutdown is ShutdownWithContext. A non-nil stopped is set once the OnPreShutdown
+// hooks are done, before the server is told to stop accepting, so that a Serve
+// the server has not registered a listener for yet can still see the shutdown.
+func (app *App) runShutdown(ctx context.Context, stopped *atomic.Bool) error {
 	app.mutex.Lock()
 	server := app.server
 	app.mutex.Unlock()
@@ -1413,6 +1425,10 @@ func (app *App) ShutdownWithContext(ctx context.Context) error {
 	// Use a closure so the hooks receive the final error; a plain
 	// `defer ...(err)` would capture the nil value at registration time.
 	defer func() { app.hooks.executeOnPostShutdownHooks(err) }()
+
+	if stopped != nil {
+		stopped.Store(true)
+	}
 
 	err = server.ShutdownWithContext(ctx)
 	return err

@@ -19,6 +19,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"text/tabwriter"
 	"time"
 
@@ -47,6 +49,10 @@ var ErrCertFileAndKeyRequired = errors.New("tls: CertFile and CertKeyFile must b
 // ListenConfig is a struct to customize startup of Fiber.
 type ListenConfig struct {
 	// GracefulContext is a field to shutdown Fiber by given context gracefully.
+	//
+	// A context that is done before the server starts to serve, including one that is
+	// already done when Listen or Listener is called, shuts it down the same way:
+	// Listen and Listener return once the shutdown has finished.
 	//
 	// With EnablePrefork the context stops only the process it is canceled in;
 	// deliver the signal to every process so each child drains its own connections.
@@ -327,7 +333,7 @@ func (app *App) Listen(addr string, config ...ListenConfig) error {
 	app.hookHeaderReceived()
 
 	served = true
-	return app.server.Serve(ln)
+	return app.serve(ln, &cfg)
 }
 
 // warnSupersededTLSFields logs the ListenConfig TLS fields a supplied TLSConfig
@@ -463,7 +469,7 @@ func (app *App) Listener(ln net.Listener, config ...ListenConfig) error {
 	}
 	app.hookHeaderReceived()
 
-	return app.server.Serve(ln)
+	return app.serve(ln, &cfg)
 }
 
 // Create listener function.
@@ -728,6 +734,8 @@ func (app *App) startGracefulShutdown(cfg *ListenConfig) func() {
 		return func() {}
 	}
 
+	app.gracefulStopped.Store(false)
+
 	done := make(chan struct{})
 	stop := context.AfterFunc(cfg.GracefulContext, func() {
 		defer close(done)
@@ -742,13 +750,60 @@ func (app *App) startGracefulShutdown(cfg *ListenConfig) func() {
 }
 
 func (app *App) gracefulShutdown(cfg *ListenConfig) {
-	// The OnPostShutdown hooks are fired by ShutdownWithContext (via
-	// Shutdown/ShutdownWithTimeout) with the real error, so we must not fire
-	// them again here or they would run twice. That error is already delivered
-	// to those hooks, so it is intentionally ignored here.
+	ctx := context.Background()
 	if cfg != nil && cfg.ShutdownTimeout > 0 {
-		_ = app.ShutdownWithTimeout(cfg.ShutdownTimeout) //nolint:errcheck // error is delivered to OnPostShutdown hooks
-	} else {
-		_ = app.Shutdown() //nolint:errcheck // error is delivered to OnPostShutdown hooks
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cfg.ShutdownTimeout)
+		defer cancel()
 	}
+
+	// The OnPostShutdown hooks are fired by runShutdown with the real error, so we
+	// must not fire them again here or they would run twice. That error is
+	// already delivered to those hooks, so it is intentionally ignored here.
+	_ = app.runShutdown(ctx, &app.gracefulStopped) //nolint:errcheck // error is delivered to OnPostShutdown hooks
+}
+
+// serve hands ln to fasthttp. Shutdown only closes the listeners Serve has already
+// registered, so one that ran earlier closed nothing and the Serve that follows
+// would never return. With a GracefulContext, ln is wrapped so that it stops Serve itself.
+func (app *App) serve(ln net.Listener, cfg *ListenConfig) error {
+	if cfg.GracefulContext != nil {
+		ln = &gracefulListener{Listener: ln, stopped: &app.gracefulStopped}
+	}
+
+	return app.server.Serve(ln)
+}
+
+// gracefulListener ends Serve once the shutdown that GracefulContext started has stopped
+// the server from accepting, however early that is.
+//
+// Serve registers a listener before it first accepts on it, and the shutdown sets stopped
+// before it closes the registered listeners. So either the shutdown finds the listener and
+// closes it, or Accept finds stopped set: no shutdown can fall between the two.
+type gracefulListener struct {
+	net.Listener
+	stopped  *atomic.Bool
+	closeErr error
+	once     sync.Once
+}
+
+// Accept refuses once the shutdown has stopped the server, and closes the listener as
+// the shutdown would have. net.ErrClosed is the error Serve takes for a closed listener
+// and returns nil on, as it does after a shutdown. Until then Accept keeps accepting,
+// as the OnPreShutdown hooks run while the server still serves.
+func (l *gracefulListener) Accept() (net.Conn, error) {
+	if l.stopped.Load() {
+		_ = l.Close() //nolint:errcheck // Shutdown gets the same result from Close
+		return nil, net.ErrClosed
+	}
+
+	return l.Listener.Accept() //nolint:wrapcheck // fasthttp inspects this error itself, so it must not be wrapped
+}
+
+// Close closes the listener once, so that Shutdown closing it after Accept did still
+// succeed instead of passing a closed-listener error to OnPostShutdown.
+func (l *gracefulListener) Close() error {
+	l.once.Do(func() { l.closeErr = l.Listener.Close() })
+
+	return l.closeErr
 }

@@ -85,7 +85,7 @@ func (app *App) prefork(addr string, tlsConfig *tls.Config, cfg *ListenConfig) e
 		}
 
 		// listen for incoming connections
-		return app.server.Serve(ln)
+		return app.serve(ln, cfg)
 	}
 
 	// Master callback: child spawned → execute OnFork hooks
