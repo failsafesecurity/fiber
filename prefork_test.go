@@ -138,7 +138,7 @@ func Test_preforkServe_GracefulContext_DoneBeforeServe(t *testing.T) {
 
 			f := newGracefulFixture(t)
 			// The child calls this right before it serves.
-			f.cfg.ListenerAddrFunc = func(net.Addr) { f.cancelAndAwait(t) }
+			f.cfg.ListenerAddrFunc = func(net.Addr) { f.cancelAndAwait() }
 			if start.prepare != nil {
 				start.prepare(f)
 			}

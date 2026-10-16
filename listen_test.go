@@ -1754,14 +1754,13 @@ func newShutdownProbe(app *App) *shutdownProbe {
 	return p
 }
 
-// await returns once the shutdown has finished. Called from the startup, it puts the whole
-// shutdown ahead of Serve without relying on timing.
-func (p *shutdownProbe) await(t *testing.T) {
-	t.Helper()
-
-	if _, ok := receiveOrTimeout(p.posted); !ok {
-		t.Error("OnPostShutdown did not run")
-	}
+// await returns once the shutdown has finished, or when receiveOrTimeout gives up. Called from the
+// startup, it puts the whole shutdown ahead of Serve without relying on timing. It reports nothing,
+// on purpose: when the shutdown does not come, Serve never returns and awaitServe fails the test
+// from the test goroutine, whereas a report from here could land after the test has completed,
+// which panics the whole test binary.
+func (p *shutdownProbe) await() {
+	_, _ = receiveOrTimeout(p.posted)
 }
 
 // requireCleanShutdown expects one shutdown that finished without an error.
@@ -1853,11 +1852,9 @@ func (f *gracefulFixture) start(run func(f *gracefulFixture) error) <-chan error
 
 // cancelAndAwait cancels the context, which does nothing to one that is done already, and returns
 // once the shutdown has finished.
-func (f *gracefulFixture) cancelAndAwait(t *testing.T) {
-	t.Helper()
-
+func (f *gracefulFixture) cancelAndAwait() {
 	f.cancel()
-	f.probe.await(t)
+	f.probe.await()
 }
 
 // requireStopped expects the server to have returned nil after exactly one clean shutdown.
@@ -1955,7 +1952,7 @@ func Test_GracefulContext_DoneBeforeServe(t *testing.T) {
 					t.Parallel()
 
 					f := newGracefulFixture(t)
-					point.wire(f, func() { f.cancelAndAwait(t) })
+					point.wire(f, func() { f.cancelAndAwait() })
 					if start.prepare != nil {
 						start.prepare(f)
 					}
@@ -2000,7 +1997,7 @@ func Test_Listen_GracefulContext_ClosesListener(t *testing.T) {
 
 	f := newGracefulFixture(t)
 	f.cfg.ListenerNetwork = NetworkUnix
-	onListenPoint.wire(f, func() { f.cancelAndAwait(t) })
+	onListenPoint.wire(f, func() { f.cancelAndAwait() })
 
 	f.requireStopped(t, f.start(func(f *gracefulFixture) error { return f.app.Listen(sock, f.cfg) }))
 
@@ -2058,7 +2055,7 @@ func Test_GracefulContext_ShutdownAfterEarlyCancel(t *testing.T) {
 	t.Parallel()
 
 	f := newGracefulFixture(t)
-	onListenPoint.wire(f, func() { f.cancelAndAwait(t) })
+	onListenPoint.wire(f, func() { f.cancelAndAwait() })
 
 	require.NoError(t, awaitServe(t, f.start(listenerEntry.run)))
 	require.NoError(t, f.app.Shutdown())
