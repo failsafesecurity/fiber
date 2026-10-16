@@ -132,7 +132,7 @@ func (h *Hooks) OnGroupName(handler ...OnGroupNameHandler)
 
 ## OnListen
 
-Runs when the app starts listening via `Listen` or `Listener`, before the startup message is printed. With prefork enabled it runs once, in the master process after the child processes have started; the children do not run it.
+Runs when the app starts listening via `Listen` or `Listener`, before the startup message is printed. With prefork enabled it runs once, in the master process after the child processes have started; the children do not run it. It does not run when a shutdown started by `GracefulContext` has already stopped the server by then.
 
 ```go title="Signature"
 func (h *Hooks) OnListen(handler ...OnListenHandler)

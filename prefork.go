@@ -70,23 +70,7 @@ func (app *App) prefork(addr string, tlsConfig *tls.Config, cfg *ListenConfig) e
 	}
 
 	// Child process: serve function wraps TLS, starts up process, etc.
-	p.ServeFunc = func(ln net.Listener) error {
-		// wrap a tls config around the listener if provided
-		if tlsConfig != nil {
-			ln = tls.NewListener(ln, tlsConfig)
-		}
-
-		// prepare the server for the start
-		app.startupProcess()
-		app.hookHeaderReceived()
-
-		if cfg.ListenerAddrFunc != nil {
-			cfg.ListenerAddrFunc(ln.Addr())
-		}
-
-		// listen for incoming connections
-		return app.serve(ln, cfg)
-	}
+	p.ServeFunc = app.preforkServe(tlsConfig, cfg)
 
 	// Master callback: child spawned → execute OnFork hooks
 	p.OnChildSpawn = func(pid int) error {
@@ -118,6 +102,28 @@ func (app *App) prefork(addr string, tlsConfig *tls.Config, cfg *ListenConfig) e
 	}
 
 	return nil
+}
+
+// preforkServe returns what a prefork child runs on the listener it inherits from the
+// master: it wraps TLS around it, starts up the process and serves.
+func (app *App) preforkServe(tlsConfig *tls.Config, cfg *ListenConfig) func(ln net.Listener) error {
+	return func(ln net.Listener) error {
+		// wrap a tls config around the listener if provided
+		if tlsConfig != nil {
+			ln = tls.NewListener(ln, tlsConfig)
+		}
+
+		// prepare the server for the start
+		app.startupProcess()
+		app.hookHeaderReceived()
+
+		if cfg.ListenerAddrFunc != nil {
+			cfg.ListenerAddrFunc(ln.Addr())
+		}
+
+		// listen for incoming connections
+		return app.serveGraceful(ln, cfg)
+	}
 }
 
 // dummyCmd is for internal prefork testing
