@@ -74,7 +74,7 @@ func (app *App) prefork(addr string, tlsConfig *tls.Config, cfg *ListenConfig) e
 	// starts to watch in preforkServe, once it has its listener.
 	if !IsChild() {
 		graceful := app.watchGracefulContext(cfg)
-		defer graceful.wait()
+		defer graceful.stopAndWait()
 	}
 
 	// Child process: serve function wraps TLS, starts up process, etc.
@@ -119,7 +119,7 @@ func (app *App) preforkServe(tlsConfig *tls.Config, cfg *ListenConfig) func(ln n
 		// Watch the context only once the child has its listener, so that a bind that failed
 		// never ran the shutdown hooks, and wait out the shutdown before returning.
 		graceful := app.watchGracefulContext(cfg)
-		defer graceful.wait()
+		defer graceful.stopAndWait()
 
 		// wrap a tls config around the listener if provided
 		if tlsConfig != nil {
@@ -135,7 +135,7 @@ func (app *App) preforkServe(tlsConfig *tls.Config, cfg *ListenConfig) func(ln n
 		}
 
 		// listen for incoming connections
-		return app.server.Serve(graceful.wrap(ln))
+		return app.serve(graceful, ln)
 	}
 }
 

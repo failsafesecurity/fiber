@@ -132,16 +132,14 @@ func Test_Prefork_Logger(t *testing.T) {
 func Test_preforkServe_GracefulContext_DoneBeforeServe(t *testing.T) {
 	t.Parallel()
 
-	for _, start := range gracefulStarts {
-		t.Run(start.name, func(t *testing.T) {
+	for _, state := range gracefulContextStates {
+		t.Run(state.name, func(t *testing.T) {
 			t.Parallel()
 
 			f := newGracefulFixture(t)
 			// The child calls this right before it serves.
 			f.cfg.ListenerAddrFunc = func(net.Addr) { f.cancelAndAwait() }
-			if start.prepare != nil {
-				start.prepare(f)
-			}
+			state.prepare(f)
 
 			f.requireStopped(t, f.start(func(f *gracefulFixture) error { return f.app.preforkServe(nil, &f.cfg)(f.ln) }))
 			listenerEntry.requireClosed(t, f)

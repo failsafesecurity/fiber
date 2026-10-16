@@ -22,7 +22,6 @@ import (
 	"reflect"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -1400,12 +1399,12 @@ func (app *App) ShutdownWithContext(ctx context.Context) error {
 	return app.runShutdown(ctx, nil)
 }
 
-// runShutdown is the body of ShutdownWithContext, which passes a nil draining. The graceful
-// shutdown of a GracefulContext passes the flag of its run, and runShutdown sets it once the
-// OnPreShutdown hooks are done, right before the server is told to stop accepting. A Serve
-// that has not registered its listener by then closes nothing in that shutdown, and finds
-// the flag instead.
-func (app *App) runShutdown(ctx context.Context, draining *atomic.Bool) error {
+// runShutdown is the body of ShutdownWithContext, which passes a nil afterPreHooks. The graceful
+// shutdown of a GracefulContext passes a function that tells its run the server is about to
+// stop accepting, and runShutdown calls it once the OnPreShutdown hooks are done, right before
+// the server is told to stop. A Serve that has not registered its listener by then closes
+// nothing in that shutdown, and the listener of the run finds the news instead.
+func (app *App) runShutdown(ctx context.Context, afterPreHooks func()) error {
 	app.mutex.Lock()
 	server := app.server
 	app.mutex.Unlock()
@@ -1424,8 +1423,8 @@ func (app *App) runShutdown(ctx context.Context, draining *atomic.Bool) error {
 	// `defer ...(err)` would capture the nil value at registration time.
 	defer func() { app.hooks.executeOnPostShutdownHooks(err) }()
 
-	if draining != nil {
-		draining.Store(true)
+	if afterPreHooks != nil {
+		afterPreHooks()
 	}
 
 	err = server.ShutdownWithContext(ctx)

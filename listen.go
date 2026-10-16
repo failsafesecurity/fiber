@@ -304,7 +304,7 @@ func (app *App) Listen(addr string, config ...ListenConfig) error {
 	// Watch GracefulContext only once the listener exists, so that a bind that fails never
 	// runs the shutdown hooks, even for a context that is already done.
 	graceful := app.watchGracefulContext(&cfg)
-	defer graceful.wait()
+	defer graceful.stopAndWait()
 
 	// Close the listener on any path that doesn't reach Serve (which otherwise
 	// takes ownership of it) — an early error return or a panicking hook — so
@@ -336,7 +336,7 @@ func (app *App) Listen(addr string, config ...ListenConfig) error {
 	app.hookHeaderReceived()
 
 	served = true
-	return app.server.Serve(graceful.wrap(ln))
+	return app.serve(graceful, ln)
 }
 
 // warnSupersededTLSFields logs the ListenConfig TLS fields a supplied TLSConfig
@@ -446,7 +446,7 @@ func (app *App) Listener(ln net.Listener, config ...ListenConfig) error {
 
 	// Graceful shutdown
 	graceful := app.watchGracefulContext(&cfg)
-	defer graceful.wait()
+	defer graceful.stopAndWait()
 
 	// prepare the server for the start
 	app.startupProcess()
@@ -472,7 +472,7 @@ func (app *App) Listener(ln net.Listener, config ...ListenConfig) error {
 	}
 	app.hookHeaderReceived()
 
-	return app.server.Serve(graceful.wrap(ln))
+	return app.serve(graceful, ln)
 }
 
 // Create listener function.
@@ -730,6 +730,33 @@ func (app *App) printRoutesMessage() {
 	_ = w.Flush() //nolint:errcheck // It is fine to ignore the error here
 }
 
+// gracefulWatch is what Listen, Listener and a prefork process hold for the GracefulContext of
+// their ListenConfig, from watchGracefulContext: a *gracefulRun when there is a context, an
+// inertWatch when there is none. The holder defers stopAndWait and hands its listener to Serve
+// only through App.serve.
+type gracefulWatch interface {
+	// wrap returns what to hand to Serve in place of ln.
+	wrap(ln net.Listener) net.Listener
+	// stopAndWait stops watching the context and waits out a shutdown that has begun. Serve
+	// returns once the listener closes, but the holder must not hand control back while that
+	// shutdown is still draining.
+	stopAndWait()
+}
+
+// inertWatch is the gracefulWatch of a ListenConfig without a GracefulContext: it changes nothing.
+type inertWatch struct{}
+
+func (inertWatch) wrap(ln net.Listener) net.Listener { return ln }
+
+func (inertWatch) stopAndWait() {}
+
+// serve hands ln to fasthttp through watch. Every Serve of Listen, Listener and a prefork child
+// goes through here: without watch.wrap, a shutdown that ran before Serve registered ln would
+// leave Serve running for ever.
+func (app *App) serve(watch gracefulWatch, ln net.Listener) error {
+	return app.server.Serve(watch.wrap(ln))
+}
+
 // gracefulRun is the graceful shutdown of one process serving through Listen, Listener or a
 // prefork child, or supervising as the prefork master: it ties ListenConfig.GracefulContext to
 // the listener the run serves.
@@ -739,7 +766,7 @@ func (app *App) printRoutesMessage() {
 // therefore wraps the listener so that it stops Serve itself.
 type gracefulRun struct {
 	app *App
-	// stop ends the watch of the context; nil when no GracefulContext is set.
+	// stop ends the watch of the context and reports whether it did so before the shutdown began.
 	stop func() bool
 	// done is closed when the shutdown the watch started has finished.
 	done chan struct{}
@@ -748,15 +775,19 @@ type gracefulRun struct {
 	draining atomic.Bool
 }
 
-// watchGracefulContext starts to watch cfg.GracefulContext. The caller hands its listener to
-// Serve through the wrap of the returned run and defers the run's wait.
-func (app *App) watchGracefulContext(cfg *ListenConfig) *gracefulRun {
-	g := &gracefulRun{app: app}
+// watchGracefulContext starts to watch cfg.GracefulContext, if there is one.
+func (app *App) watchGracefulContext(cfg *ListenConfig) gracefulWatch {
 	if cfg.GracefulContext == nil {
-		return g
+		return inertWatch{}
 	}
 
-	g.done = make(chan struct{})
+	return app.newGracefulRun(cfg)
+}
+
+// newGracefulRun starts a run that shuts the app down once cfg.GracefulContext, which must be
+// set, is done.
+func (app *App) newGracefulRun(cfg *ListenConfig) *gracefulRun {
+	g := &gracefulRun{app: app, done: make(chan struct{})}
 	g.stop = context.AfterFunc(cfg.GracefulContext, func() {
 		defer close(g.done)
 		g.shutdown(cfg.ShutdownTimeout)
@@ -765,23 +796,19 @@ func (app *App) watchGracefulContext(cfg *ListenConfig) *gracefulRun {
 	return g
 }
 
-// wait ends the watch. Serve returns once the listener closes, so a shutdown that has begun
-// is waited out: the caller must not hand control back while it is still draining.
-func (g *gracefulRun) wait() {
-	if g.stop != nil && !g.stop() {
+func (g *gracefulRun) stopAndWait() {
+	if !g.stop() {
 		<-g.done
 	}
 }
 
-// wrap returns what the caller hands to Serve in place of ln. With a GracefulContext that is ln
-// wrapped so that a shutdown which ran before Serve registered it, and so closed nothing, still
-// ends Serve; without one it is ln itself.
 func (g *gracefulRun) wrap(ln net.Listener) net.Listener {
-	if g.stop == nil {
-		return ln
-	}
-
 	return &gracefulListener{Listener: ln, draining: &g.draining}
+}
+
+// beginDraining records that the shutdown is about to stop the server from accepting.
+func (g *gracefulRun) beginDraining() {
+	g.draining.Store(true)
 }
 
 // shutdown is the shutdown the context asks for. It waits up to timeout for the connections to
@@ -797,7 +824,7 @@ func (g *gracefulRun) shutdown(timeout time.Duration) {
 	// The OnPostShutdown hooks are fired by the shutdown with the real error, so we must not
 	// fire them again here or they would run twice. That error is already delivered to those
 	// hooks, so it is intentionally ignored here.
-	_ = g.app.runShutdown(ctx, &g.draining) //nolint:errcheck // error is delivered to OnPostShutdown hooks
+	_ = g.app.runShutdown(ctx, g.beginDraining) //nolint:errcheck // error is delivered to OnPostShutdown hooks
 }
 
 // gracefulListener ends Serve once the shutdown that GracefulContext started is draining, that
